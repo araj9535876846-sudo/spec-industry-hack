@@ -1,42 +1,19 @@
-import os
+import asyncio
 import json
-import tempfile
+import uuid
+from typing import Dict, List
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from openai import OpenAI
-from dotenv import load_dotenv
 
 
 # =========================================================
-# LOAD ENVIRONMENT
-# =========================================================
-
-load_dotenv()
-
-
-# =========================================================
-# OPENAI CLIENT
-# =========================================================
-
-api_key = os.getenv("OPENAI_API_KEY")
-
-if not api_key:
-    raise RuntimeError(
-        "OPENAI_API_KEY is not configured."
-    )
-
-client = OpenAI(api_key=api_key)
-
-
-# =========================================================
-# FASTAPI
+# HEALTHBRIDGE REAL-TIME ANONYMOUS CHAT SERVER
 # =========================================================
 
 app = FastAPI(
-    title="HealthBridge API",
-    description="Backend API for HealthBridge",
-    version="1.0.0",
+    title="HealthBridge Anonymous Chat",
+    version="2.0.0",
 )
 
 
@@ -46,14 +23,200 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# =========================================================
+# CONNECTION STATE
+# =========================================================
+
+class ConnectionManager:
+
+    def __init__(self):
+        # websocket -> anonymous user information
+        self.active_connections: Dict[
+            WebSocket, dict
+        ] = {}
+
+        # Users waiting for another anonymous person
+        self.waiting_users: List[
+            WebSocket
+        ] = []
+
+        # user websocket -> partner websocket
+        self.partners: Dict[
+            WebSocket, WebSocket
+        ] = {}
+
+        self.lock = asyncio.Lock()
+
+    # -----------------------------------------------------
+    # CREATE ANONYMOUS USER
+    # -----------------------------------------------------
+
+    def create_anonymous_id(self):
+
+        return (
+            "Anonymous-"
+            + str(uuid.uuid4())[:6].upper()
+        )
+
+    # -----------------------------------------------------
+    # CONNECT
+    # -----------------------------------------------------
+
+    async def connect(
+        self,
+        websocket: WebSocket,
+    ):
+
+        await websocket.accept()
+
+        anonymous_id = (
+            self.create_anonymous_id()
+        )
+
+        self.active_connections[
+            websocket
+        ] = {
+            "id": anonymous_id
+        }
+
+        return anonymous_id
+
+    # -----------------------------------------------------
+    # DISCONNECT
+    # -----------------------------------------------------
+
+    async def disconnect(
+        self,
+        websocket: WebSocket,
+    ):
+
+        async with self.lock:
+
+            if websocket in self.waiting_users:
+
+                self.waiting_users.remove(
+                    websocket
+                )
+
+            partner = self.partners.pop(
+                websocket,
+                None
+            )
+
+            self.active_connections.pop(
+                websocket,
+                None
+            )
+
+            if partner:
+
+                self.partners.pop(
+                    partner,
+                    None
+                )
+
+                return partner
+
+        return None
+
+    # -----------------------------------------------------
+    # FIND ANOTHER ANONYMOUS USER
+    # -----------------------------------------------------
+
+    async def find_match(
+        self,
+        websocket: WebSocket,
+    ):
+
+        async with self.lock:
+
+            # Already matched
+            if websocket in self.partners:
+                return None
+
+            # Find waiting user
+            while self.waiting_users:
+
+                partner = self.waiting_users.pop(
+                    0
+                )
+
+                # Make sure connection is still alive
+                if partner not in self.active_connections:
+                    continue
+
+                if partner == websocket:
+                    continue
+
+                self.partners[
+                    websocket
+                ] = partner
+
+                self.partners[
+                    partner
+                ] = websocket
+
+                return partner
+
+            # Nobody available
+            if websocket not in self.waiting_users:
+
+                self.waiting_users.append(
+                    websocket
+                )
+
+            return None
+
+    # -----------------------------------------------------
+    # SEND TO USER
+    # -----------------------------------------------------
+
+    async def send(
+        self,
+        websocket: WebSocket,
+        data: dict,
+    ):
+
+        try:
+
+            await websocket.send_json(
+                data
+            )
+
+        except Exception:
+
+            pass
+
+    # -----------------------------------------------------
+    # SEND TO PARTNER
+    # -----------------------------------------------------
+
+    async def send_to_partner(
+        self,
+        websocket: WebSocket,
+        data: dict,
+    ):
+
+        partner = self.partners.get(
+            websocket
+        )
+
+        if partner:
+
+            await self.send(
+                partner,
+                data
+            )
+
+
+manager = ConnectionManager()
 
 
 # =========================================================
@@ -62,298 +225,257 @@ app.add_middleware(
 
 @app.get("/")
 async def root():
+
     return {
         "status": "online",
-        "service": "HealthBridge API",
+        "service": "HealthBridge",
+        "feature": "Anonymous real-time chat",
     }
 
 
 # =========================================================
-# LANGUAGE DETECTION
+# STATS
 # =========================================================
 
-@app.post("/api/detect-language")
-async def detect_language(
-    audio: UploadFile = File(...)
+@app.get("/api/stats")
+async def stats():
+
+    return {
+        "online_users": len(
+            manager.active_connections
+        ),
+        "waiting_users": len(
+            manager.waiting_users
+        ),
+        "active_chats": len(
+            manager.partners
+        ) // 2,
+    }
+
+
+# =========================================================
+# WEBSOCKET CHAT
+# =========================================================
+
+@app.websocket("/ws/chat")
+async def websocket_chat(
+    websocket: WebSocket,
 ):
 
-    if not audio:
-        raise HTTPException(
-            status_code=400,
-            detail="No audio file received.",
-        )
-
-    allowed_types = [
-        "audio/webm",
-        "audio/wav",
-        "audio/wave",
-        "audio/mpeg",
-        "audio/mp4",
-        "audio/ogg",
-        "audio/x-wav",
-    ]
-
-    content_type = audio.content_type or ""
-
-    # Browser MediaRecorder may append codecs,
-    # therefore we only check the beginning.
-    valid_type = any(
-        content_type.startswith(item)
-        for item in allowed_types
-    )
-
-    if not valid_type:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported audio type: {content_type}",
-        )
-
-    audio_bytes = await audio.read()
-
-    if not audio_bytes:
-        raise HTTPException(
-            status_code=400,
-            detail="Audio file is empty.",
-        )
-
-    temp_path = None
+    anonymous_id = None
 
     try:
 
-        # =================================================
-        # CREATE TEMP AUDIO FILE
-        # =================================================
+        # -------------------------------------------------
+        # CONNECT USER
+        # -------------------------------------------------
 
-        suffix = ".webm"
+        anonymous_id = await manager.connect(
+            websocket
+        )
 
-        if "wav" in content_type:
-            suffix = ".wav"
-        elif "mpeg" in content_type:
-            suffix = ".mp3"
-        elif "mp4" in content_type:
-            suffix = ".mp4"
-        elif "ogg" in content_type:
-            suffix = ".ogg"
+        # -------------------------------------------------
+        # SEND ANONYMOUS ID
+        # -------------------------------------------------
 
-        with tempfile.NamedTemporaryFile(
-            delete=False,
-            suffix=suffix,
-        ) as temp_file:
+        await manager.send(
+            websocket,
+            {
+                "type": "connected",
+                "anonymous_id": anonymous_id,
+                "message":
+                    "You are connected anonymously.",
+            },
+        )
 
-            temp_file.write(audio_bytes)
+        # -------------------------------------------------
+        # WAIT FOR MATCH
+        # -------------------------------------------------
 
-            temp_path = temp_file.name
+        partner = await manager.find_match(
+            websocket
+        )
 
+        if partner:
 
-        # =================================================
-        # TRANSCRIBE AUDIO
-        # =================================================
+            my_id = anonymous_id
 
-        with open(
-            temp_path,
-            "rb",
-        ) as audio_file:
+            partner_id = manager.active_connections[
+                partner
+            ]["id"]
 
-            transcription = (
-                client.audio.transcriptions.create(
-                    model="gpt-4o-mini-transcribe",
-                    file=audio_file,
-                    response_format="json",
+            # Notify current user
+
+            await manager.send(
+                websocket,
+                {
+                    "type": "matched",
+                    "anonymous_id": my_id,
+                    "partner_id": partner_id,
+                    "message":
+                        "You have been anonymously matched with another person.",
+                },
+            )
+
+            # Notify partner
+
+            await manager.send(
+                partner,
+                {
+                    "type": "matched",
+                    "anonymous_id":
+                        manager.active_connections[
+                            partner
+                        ]["id"],
+                    "partner_id": my_id,
+                    "message":
+                        "You have been anonymously matched with another person.",
+                },
+            )
+
+        else:
+
+            await manager.send(
+                websocket,
+                {
+                    "type": "waiting",
+                    "message":
+                        "Waiting for another anonymous person...",
+                },
+            )
+
+        # -------------------------------------------------
+        # MAIN MESSAGE LOOP
+        # -------------------------------------------------
+
+        while True:
+
+            data = await websocket.receive_json()
+
+            message_type = data.get(
+                "type"
+            )
+
+            # =================================================
+            # CHAT MESSAGE
+            # =================================================
+
+            if message_type == "message":
+
+                text = str(
+                    data.get(
+                        "text",
+                        ""
+                    )
+                ).strip()
+
+                if not text:
+                    continue
+
+                # Basic safety limit
+                if len(text) > 2000:
+
+                    await manager.send(
+                        websocket,
+                        {
+                            "type": "error",
+                            "message":
+                                "Message is too long.",
+                        },
+                    )
+
+                    continue
+
+                sender = manager.active_connections[
+                    websocket
+                ]["id"]
+
+                await manager.send_to_partner(
+                    websocket,
+                    {
+                        "type": "message",
+                        "sender": sender,
+                        "text": text,
+                    },
                 )
-            )
 
+            # =================================================
+            # TYPING INDICATOR
+            # =================================================
 
-        transcript = getattr(
-            transcription,
-            "text",
-            "",
-        )
+            elif message_type == "typing":
 
+                await manager.send_to_partner(
+                    websocket,
+                    {
+                        "type": "typing",
+                        "sender":
+                            manager.active_connections[
+                                websocket
+                            ]["id"],
+                    },
+                )
 
-        # =================================================
-        # LANGUAGE IDENTIFICATION
-        # =================================================
+            # =================================================
+            # STOP TYPING
+            # =================================================
 
-        if not transcript.strip():
+            elif message_type == "stop_typing":
 
-            raise HTTPException(
-                status_code=422,
-                detail="No speech could be detected.",
-            )
+                await manager.send_to_partner(
+                    websocket,
+                    {
+                        "type": "stop_typing",
+                    },
+                )
 
+            # =================================================
+            # LEAVE CHAT
+            # =================================================
 
-        language_prompt = f"""
-You are a language identification system.
+            elif message_type == "leave":
 
-Identify the primary language used in the
-following speech transcript.
+                partner = manager.partners.get(
+                    websocket
+                )
 
-The system is designed for Indian users.
+                if partner:
 
-Possible languages include:
+                    await manager.send(
+                        partner,
+                        {
+                            "type": "partner_left",
+                            "message":
+                                "The other anonymous user left the conversation.",
+                        },
+                    )
 
-English
-Hindi
-Telugu
-Tamil
-Kannada
-Malayalam
-Bengali
-Marathi
-Gujarati
-Punjabi
-Urdu
+                break
 
-Also identify mixed-language speech when appropriate.
+    except WebSocketDisconnect:
 
-Examples:
-
-"mujhe bahut stress ho raha hai"
-=> Hindi
-
-"నాకు చాలా stress గా ఉంది"
-=> Telugu
-
-"எனக்கு மிகவும் stress ஆக உள்ளது"
-=> Tamil
-
-"mujhe exam ka tension hai"
-=> Hinglish / Hindi
-
-Return ONLY valid JSON.
-
-Required format:
-
-{
-    "language": "Telugu",
-    "language_code": "te-IN",
-    "confidence": 0.96,
-    "mixed_language": false
-}
-
-Transcript:
-
-{transcript}
-"""
-
-
-        response = client.responses.create(
-            model="gpt-5.6-mini",
-            input=language_prompt,
-        )
-
-
-        result_text = response.output_text.strip()
-
-
-        # =================================================
-        # CLEAN POSSIBLE MARKDOWN
-        # =================================================
-
-        if result_text.startswith("```"):
-
-            result_text = (
-                result_text
-                .replace("```json", "")
-                .replace("```", "")
-                .strip()
-            )
-
-
-        # =================================================
-        # PARSE JSON
-        # =================================================
-
-        try:
-
-            result = json.loads(
-                result_text
-            )
-
-        except json.JSONDecodeError:
-
-            raise HTTPException(
-                status_code=500,
-                detail=(
-                    "Language identification "
-                    "returned invalid JSON."
-                ),
-            )
-
-
-        # =================================================
-        # NORMALIZE RESPONSE
-        # =================================================
-
-        language = result.get(
-            "language",
-            "English",
-        )
-
-        language_code = result.get(
-            "language_code",
-            "en-IN",
-        )
-
-        confidence = result.get(
-            "confidence",
-            0.0,
-        )
-
-        mixed_language = result.get(
-            "mixed_language",
-            False,
-        )
-
-
-        # =================================================
-        # FINAL RESPONSE
-        # =================================================
-
-        return {
-            "success": True,
-
-            "language": language,
-
-            "language_code": language_code,
-
-            "confidence": confidence,
-
-            "mixed_language": mixed_language,
-
-            "transcript": transcript,
-        }
-
-
-    except HTTPException:
-        raise
+        pass
 
     except Exception as error:
 
         print(
-            "Language detection error:",
-            error,
+            "WebSocket error:",
+            error
         )
-
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "Language detection failed."
-            ),
-        )
-
 
     finally:
 
-        # =================================================
-        # DELETE TEMP AUDIO
-        # =================================================
+        partner = await manager.disconnect(
+            websocket
+        )
 
-        if temp_path and os.path.exists(
-            temp_path
-        ):
+        if partner:
 
-            try:
-                os.remove(temp_path)
-            except Exception:
-                pass    
+            await manager.send(
+                partner,
+                {
+                    "type": "partner_left",
+                    "message":
+                        "The other anonymous user disconnected.",
+                },
+            )
